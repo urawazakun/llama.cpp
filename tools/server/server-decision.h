@@ -90,7 +90,8 @@ struct server_decision_context {
             const std::vector<raw_buffer> & files,
             mtmd_context * mctx,
             const mtmd_helper_init_opt & init_opt,
-            server_task & task) const;
+            server_task & task,
+        bool cache_prefix = false) const;
 
     // set the prompt of all the questions, the result has the scores of all their options, in order
     // mctx is only used if there are files

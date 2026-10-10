@@ -39,6 +39,16 @@
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
+// d1: short stable hex digest for trunk ids in logs (never print raw ids: newline risk)
+static std::string d1_id_log(const std::string & id) {
+    uint64_t h = 1469598103934665603ull;
+    for (const char c : id) {
+        h ^= (uint8_t) c;
+        h *= 1099511628211ull;
+    }
+    return string_format("len=%llu:%08x", (unsigned long long) id.size(), (uint32_t) (h ^ (h >> 32)));
+}
+
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (params.embedding ||
             (params.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED && params.pooling_type != LLAMA_POOLING_TYPE_NONE)) {
@@ -305,6 +315,9 @@ struct server_slot {
 
     server_prompt prompt;
 
+    // d1 decision prefix cache: true once the prefix snapshot of the current task was stored
+    bool d1_prefix_stored = false;
+
     bool prompt_save(server_prompt_cache & prompt_cache) const {
         if (prompt.tokens.size() == 0) {
             return false;
@@ -413,6 +426,8 @@ struct server_slot {
 
         // clear multimodal state
         mbatch.reset();
+
+        d1_prefix_stored = false;
     }
 
     void init_sampler() const {
@@ -809,7 +824,12 @@ static int encode_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch,
     // TODO @ngxson : move this log line to debug when it become more stable
     SLT_TRC(slot, "encoding mtmd batch from idx = %zu, n_chunks = %d\n", idx, n_added);
 
+    const int64_t encode_start = ggml_time_us();
     res = mtmd_batch_encode(mbatch.get());
+    if (slot.task->type == SERVER_TASK_TYPE_DECISION && slot.task->decision.prefix_end > 0) {
+        SLT_INF(slot, "d1 media encode: n_chunks = %d, took %.3f ms\n",
+                n_added, (ggml_time_us() - encode_start) / 1000.0);
+    }
     if (res != 0) {
         SLT_ERR(slot, "failed to encode mtmd batch for chunk idx = %zu, res = %d\n", idx, res);
         return -1;
@@ -1015,6 +1035,75 @@ private:
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
+    // d1 explicit trunk cache: bounded full-state (FLAGS_NONE) snapshots keyed by trunk id
+    // the stored prefix tokens own deep-copied media chunks, so text ids and mtmd chunk
+    // SHA256 ids + n_tokens are compared exactly on lookup (no raw file bytes here)
+    struct d1_trunk_entry {
+        std::string id;
+        server_tokens prefix;
+        std::vector<uint8_t> st_tgt;
+        std::vector<uint8_t> st_dft;
+        int64_t t_last = 0;
+        size_t size() const {
+            return st_tgt.size() + st_dft.size() + prefix.size() * sizeof(llama_token) + 4096 + id.size();
+        }
+    };
+    std::list<d1_trunk_entry> d1_trunks;
+
+    size_t d1_trunk_limit_bytes() const {
+        return params_base.decision_trunk_cache_mib <= 0
+            ? 0
+            : (size_t) params_base.decision_trunk_cache_mib * 1024ull * 1024ull;
+    }
+
+    size_t d1_trunks_size() const {
+        size_t res = 0;
+        for (const auto & t : d1_trunks) {
+            res += t.size();
+        }
+        return res;
+    }
+
+    // touch entry (LRU) and return it, or nullptr
+    d1_trunk_entry * d1_trunk_touch(const std::string & id) {
+        for (auto it = d1_trunks.begin(); it != d1_trunks.end(); ++it) {
+            if (it->id == id) {
+                it->t_last = ggml_time_us();
+                d1_trunks.splice(d1_trunks.end(), d1_trunks, it);
+                return &d1_trunks.back();
+            }
+        }
+        return nullptr;
+    }
+
+    // store (or replace) a trunk snapshot; evicts oldest until it fits. returns false when skipped
+    bool d1_trunk_store(std::string id, server_tokens prefix, std::vector<uint8_t> st_tgt, std::vector<uint8_t> st_dft) {
+        const size_t limit = d1_trunk_limit_bytes();
+        const size_t size_new = st_tgt.size() + st_dft.size() + prefix.size() * sizeof(llama_token) + 4096 + id.size();
+        if (limit == 0 || size_new == 0 || size_new > limit) {
+            return false;
+        }
+        // replace same id outright (a differing prefix under the same id must not survive)
+        for (auto it = d1_trunks.begin(); it != d1_trunks.end();) {
+            if (it->id == id) {
+                it = d1_trunks.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        while (!d1_trunks.empty() && d1_trunks_size() + size_new > limit) {
+            d1_trunks.pop_front();
+        }
+        d1_trunk_entry e;
+        e.id      = std::move(id);
+        e.prefix  = std::move(prefix);
+        e.st_tgt  = std::move(st_tgt);
+        e.st_dft  = std::move(st_dft);
+        e.t_last  = ggml_time_us();
+        d1_trunks.push_back(std::move(e));
+        return true;
+    }
+
     server_metrics metrics;
 
     // queued prompt stats - llama_decode() is async, so the timing is only valid after a sync
@@ -1037,6 +1126,10 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
+        // d1: trunk blobs reference dead contexts after unload; drop them here
+        // (also covers the sleeping path, which calls destroy())
+        d1_trunks.clear();
+
         spec.reset();
         spec_init.reset();
 
@@ -2931,6 +3024,11 @@ private:
                     }
                     // TODO @ngxson : make lora_adapters a dedicated member of server_context
                     params_base.lora_adapters = new_loras;
+                    // d1: adapter config changed, stored full-state snapshots are stale: flush
+                    if (!d1_trunks.empty()) {
+                        SRV_INF("d1: flushing %zu trunk entries after LoRA change\n", d1_trunks.size());
+                        d1_trunks.clear();
+                    }
                     auto res = std::make_unique<server_task_result_apply_lora>();
                     res->id = task.id;
                     queue_results.send(std::move(res));
@@ -3526,6 +3624,84 @@ private:
                                 n_past = 0;
                             }
 
+                            // d1 decision prefix/trunk path: exact full-state restore, decided before pos_next is derived
+                            // prefix_end == 0 means unsupported: no split, no new cache behavior
+                            // (bypass still forces full recompute so cold refs stay reliable)
+                            const auto & d1dec0 = slot.task->decision;
+                            if (params_base.decision_prefix_cache
+                                    && slot.task->type == SERVER_TASK_TYPE_DECISION
+                                    && d1dec0.cache_bypass && slot.task->id_parent < 0) {
+                                // matched cold geometry reference: same split below, but always recompute
+                                n_past = 0;
+                                SLT_TRC(slot, "%s", "d1 bypass: forcing full recompute\n");
+                            }
+                            const bool d1_task0 = params_base.decision_prefix_cache
+                                && slot.task->type == SERVER_TASK_TYPE_DECISION
+                                && !d1dec0.labels.empty()
+                                && d1dec0.prefix_end > 0
+                                && d1dec0.prefix_end < slot.task->n_tokens()
+                                && (!d1dec0.cache_bypass || slot.task->id_parent >= 0);
+                            // snapshots are refused with LoRA, draft model or speculative state:
+                            // safe miss/recompute instead of risking stale state
+                            const bool d1_state_ok = !d1dec0.cache_bypass && slot.task->id_parent < 0
+                                && slot.lora.empty() && ctx_dft == nullptr && !slot.can_speculate();
+                            bool d1_trunk_hit = false;
+                            if (d1_task0 && d1_state_ok && !d1dec0.trunk_id.empty()) {
+                                if (auto * t = d1_trunk_touch(d1dec0.trunk_id)) {
+                                    const size_t n_pre = t->prefix.size();
+                                    const std::string id_log = d1_id_log(d1dec0.trunk_id);
+                                    if ((int32_t) n_pre == d1dec0.prefix_end
+                                            && t->st_dft.empty()
+                                            && t->prefix.get_common_prefix(input_tokens) == n_pre) {
+                                        const int64_t t0 = ggml_time_us();
+                                        const float mib = (float) t->size() / 1024.0f / 1024.0f;
+                                        bool ok = false;
+                                        try {
+                                            ok = llama_state_seq_set_data_ext(ctx_tgt, t->st_tgt.data(), t->st_tgt.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_NONE) == t->st_tgt.size();
+                                        } catch (...) {
+                                            ok = false;
+                                        }
+                                        if (ok) {
+                                            // adopt the stored prefix tokens (they own the media identity)
+                                            // and drop stale partial checkpoints that describe older memory
+                                            slot.prompt.tokens = t->prefix.clone();
+                                            slot.prompt.checkpoints.clear();
+                                            n_past = (int32_t) n_pre;
+                                            d1_trunk_hit = true;
+                                            slot.d1_prefix_stored = true;
+                                            SLT_INF(slot, "d1 trunk hit: id = %s, n_past = %d, state = %.3f MiB, restore took %.2f ms\n",
+                                                    id_log.c_str(), n_past, mib, (ggml_time_us() - t0) / 1000.0);
+                                        } else {
+                                            // a partial mutation may have happened: drop memory, prompt
+                                            // and entry, then recompute safely
+                                            SLT_WRN(slot, "d1 trunk restore failed: id = %s, clearing seq and recomputing\n", id_log.c_str());
+                                            try {
+                                                slot.mem.seq_rm(slot.id, -1, -1);
+                                            } catch (...) {}
+                                            slot.prompt.clear();
+                                            n_past = 0;
+                                            for (auto it = d1_trunks.begin(); it != d1_trunks.end(); ++it) {
+                                                if (it->id == d1dec0.trunk_id) {
+                                                    d1_trunks.erase(it);
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        SLT_INF(slot, "d1 trunk miss: id = %s stored prefix %zu != %d, recompute and replace on store\n",
+                                                id_log.c_str(), n_pre, d1dec0.prefix_end);
+                                    }
+                                } else {
+                                    SLT_TRC(slot, "d1 trunk miss: id = %s not stored\n", d1_id_log(d1dec0.trunk_id).c_str());
+                                }
+                            }
+                            // d1 matched geometry: never reuse past the prefix boundary, so the
+                            // first prompt splits at the exact prefix and the suffix replays later
+                            // in the same physical ubatch shape
+                            if (d1_task0 && !d1_trunk_hit && d1dec0.prefix_end > 0) {
+                                n_past = std::min(n_past, d1dec0.prefix_end);
+                            }
+
                             llama_pos pos_next = slot.prompt.tokens.pos_next(n_past);
 
                             // ref: https://github.com/ggml-org/llama.cpp/pull/24110
@@ -3584,7 +3760,9 @@ private:
                                     SLT_WRN(slot, "%s\n", st1.str().c_str());
                                 }
 
-                                if (pos_min >= pos_min_thold) {
+                                // d1 full hit already restored exact state: skip the ordinary
+                                // partial search entirely (its list was cleared, rend must not be read)
+                                if (!d1_trunk_hit && pos_min >= pos_min_thold) {
                                     // search for a context checkpoint
                                     const auto it = std::find_if(
                                         slot.prompt.checkpoints.rbegin(),
@@ -3715,8 +3893,23 @@ private:
 
                     bool do_checkpoint = params_base.n_ctx_checkpoints > 0;
 
-                    // make checkpoints only for completion tasks
-                    do_checkpoint = do_checkpoint && slot.task->type == SERVER_TASK_TYPE_COMPLETION;
+                    // d1 decision prefix cache (default off, experimental)
+                    // prefix_end == 0 means unsupported: no split, no new cache behavior
+                    // d1_split  = boundary split only (also on bypass: matched reference geometry)
+                    // d1_store  = actually retain snapshots (never on bypass/LoRA/draft/spec)
+                    const auto & d1dec = slot.task->decision;
+                    const bool d1_split = params_base.decision_prefix_cache
+                        && slot.task->type == SERVER_TASK_TYPE_DECISION
+                        && !d1dec.labels.empty()
+                        && d1dec.prefix_end > 0
+                        && d1dec.prefix_end < slot.task->n_tokens();
+                    // snapshots are refused with LoRA, draft model or speculative state (safe miss);
+                    // the split itself still applies so bypass/cached runs keep matched geometry
+                    const bool d1_store = d1_split && !d1dec.cache_bypass && slot.lora.empty()
+                        && ctx_dft == nullptr && !slot.can_speculate();
+
+                    // make checkpoints only for completion tasks (d1 decision prefix handled below)
+                    do_checkpoint = do_checkpoint && (slot.task->type == SERVER_TASK_TYPE_COMPLETION || d1_store);
 
                     // make a checkpoint of the parts of the memory that cannot be rolled back.
                     // checkpoints are created only if:
@@ -3728,10 +3921,69 @@ private:
                             ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS ||
                             n_swa > 0);
 
+                    // d1 matched geometry: decision tasks never take ordinary mid-prompt or
+                    // end-of-prompt checkpoints (offsets/min-step below would change ubatch
+                    // shape); only the forced boundary checkpoint below may fire
+                    if (slot.task->type == SERVER_TASK_TYPE_DECISION && params_base.decision_prefix_cache) {
+                        do_checkpoint = false;
+                    }
+
                     // TODO: do the same for all models, then remove process_mtmd_chunk()
                     if (use_mixed_batch() && !slot.can_split() && input_tokens.has_mtmd) {
                         if (!add_prompt_mixed(slot)) {
                             return;
+                        }
+                    }
+
+                    // d1: store the prefix snapshot once the decoded boundary is reached,
+                    // before any suffix token is submitted below. prompt tokens pushed in
+                    // earlier iterations are already decoded (build -> decode is sequential),
+                    // and the pos_max check below defers the store while that is not yet true.
+                    if (d1_store && !slot.d1_prefix_stored && slot.prompt.n_tokens() == d1dec.prefix_end) {
+                        const llama_pos pos_need = slot.prompt.tokens.pos_next(d1dec.prefix_end);
+                        const llama_pos pos_have = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+                        if (pos_have + 1 >= pos_need) {
+                            slot.d1_prefix_stored = true; // attempt once per task
+                            const int64_t t0 = ggml_time_us();
+                            const size_t sz_tgt = llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+                            const size_t sz_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+                            const size_t limit = d1_trunk_limit_bytes();
+                            if (sz_tgt == 0 || sz_tgt + sz_dft > limit) {
+                                SLT_WRN(slot, "d1 prefix store skipped: state = %.3f MiB, trunk budget = %.3f MiB\n",
+                                        (sz_tgt + sz_dft) / 1024.0f / 1024.0f, limit / 1024.0f / 1024.0f);
+                            } else {
+                                try {
+                                    if (!d1dec.trunk_id.empty() && slot.task->id_parent < 0) {
+                                        std::vector<uint8_t> st_tgt(sz_tgt);
+                                        std::vector<uint8_t> st_dft(sz_dft);
+                                        const size_t got_tgt = llama_state_seq_get_data_ext(ctx_tgt, st_tgt.data(), sz_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+                                        size_t got_dft = 0;
+                                        if (ctx_dft && sz_dft > 0) {
+                                            got_dft = llama_state_seq_get_data_ext(ctx_dft, st_dft.data(), sz_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+                                        }
+                                        // never store a silently partial snapshot: verify byte counts,
+                                        // and count cloned token/chunk metadata against the budget too.
+                                        // the prefix is cloned from slot placeholders only (already
+                                        // decoded, no raw media re-encode); metadata is bounded by the
+                                        // token count plus a conservative per-chunk allowance
+                                        const size_t meta = slot.prompt.tokens.size() * sizeof(llama_token) + 4096;
+                                        bool ok = got_tgt == sz_tgt && (sz_dft == 0 || got_dft == sz_dft)
+                                            && sz_tgt + sz_dft + meta <= limit;
+                                        if (ok) {
+                                            ok = d1_trunk_store(d1dec.trunk_id, slot.prompt.tokens.clone(), std::move(st_tgt), std::move(st_dft));
+                                        }
+                                        SLT_INF(slot, "d1 trunk stored: id = %s, n = %d, state = %.3f MiB, cache = %.3f/%.3f MiB (%s), took %.2f ms\n",
+                                                d1_id_log(d1dec.trunk_id).c_str(), d1dec.prefix_end, (sz_tgt + sz_dft) / 1024.0f / 1024.0f,
+                                                d1_trunks_size() / 1024.0f / 1024.0f, limit / 1024.0f / 1024.0f,
+                                                ok ? "kept" : "over budget", (ggml_time_us() - t0) / 1000.0);
+                                    } else {
+                                        SLT_TRC(slot, "d1 prefix decoded: n = %d, state = %.3f MiB (auto checkpoint path)\n",
+                                                d1dec.prefix_end, (sz_tgt + sz_dft) / 1024.0f / 1024.0f);
+                                    }
+                                } catch (const std::exception & e) {
+                                    SLT_WRN(slot, "d1 prefix store failed: %s\n", e.what());
+                                }
+                            }
                         }
                     }
 
@@ -3755,9 +4007,28 @@ private:
                         // encode on the worker thread, so we can still handle metrics tasks
                         size_t n_tokens_out = 0;
                         int32_t res = 0;
+                        const int64_t t_mtmd0 = ggml_time_us();
                         queue_tasks.yield_to_queue([&]() {
                             res = process_mtmd_chunk(slot, slot.mbatch, cur_token_idx, n_tokens_out);
                         });
+                        // d1: wall time around media encode for d1-enabled tasks (short chunk hash only).
+                        // this includes media encoding and model prefill; separate encode timings
+                        // are emitted by mtmd-helper. Model totals come from regular
+                        // prompt timings, the two are not separated inside process_mtmd_chunk.
+                        if (d1_split) {
+                            std::string chunk_log = "none";
+                            {
+                                const auto & ch = input_tokens.find_chunk(cur_token_idx);
+                                if (ch) {
+                                    chunk_log = mtmd_input_chunk_get_id(ch.get());
+                                    if (chunk_log.size() > 8) {
+                                        chunk_log.resize(8);
+                                    }
+                                }
+                            }
+                            SLT_INF(slot, "d1 mtmd chunk: idx = %d, n_out = %zu, id8 = %s, encode + prefill took %.2f ms\n",
+                                    (int) cur_token_idx, n_tokens_out, chunk_log.c_str(), (ggml_time_us() - t_mtmd0) / 1000.0);
+                        }
 
                         if (res != 0) {
                             SLT_ERR(slot, "failed to process mtmd chunk, res = %d\n", res);
@@ -3786,6 +4057,10 @@ private:
                     const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
 
                     // add prompt tokens for processing in the current batch
+                    // d1: the entry count guards the boundary break below, so the boundary
+                    // iteration (entry already at prefix_end) still submits suffix tokens
+                    // instead of stalling on empty batches
+                    const int d1_n_tokens_entry = slot.prompt.n_tokens();
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
@@ -3795,6 +4070,15 @@ private:
 
                         // stop at the end of the shared prefix, the children are started from this state
                         if (wait_shared && slot.prompt.n_tokens() == slot.task->n_tokens_shared) {
+                            break;
+                        }
+
+                        // d1: stop at the prefix boundary so the shared state prefix decodes
+                        // first; the suffix is submitted in a later iteration, after the
+                        // snapshot above. also applies on bypass (matched geometry).
+                        // only when the boundary was reached by this fill (entry was short of
+                        // it); otherwise the boundary iteration would submit nothing and stall.
+                        if (d1_split && d1_n_tokens_entry < d1dec.prefix_end && slot.prompt.n_tokens() == d1dec.prefix_end) {
                             break;
                         }
 
@@ -3905,6 +4189,18 @@ private:
                             is_last_user_message || near_prompt_end ||
                             n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
+
+                    // d1 auto: checkpoint the fully decoded prefix at the boundary iteration.
+                    // the fill split above guarantees the current batch holds suffix tokens only,
+                    // so this pre-decode snapshot covers exactly the prefix (recurrent partial
+                    // state; attention KV stays in place and is truncated via seq_rm on reuse).
+                    // the mtmd/spacing/user-start vetoes above do not apply: the state-end prefix
+                    // (images included) is the required snapshot point, verified decoded above.
+                    // n_ctx_checkpoints == 0 disables auto checkpoints (no crash in eviction);
+                    // explicit full trunk hits still work without any checkpoint.
+                    if (d1_store && params_base.n_ctx_checkpoints > 0 && pos_min >= 0 && n_tokens_start == d1dec.prefix_end) {
+                        do_checkpoint = true;
+                    }
 
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not
                     //       yet processed and therefore it is not part of the checkpoint.
@@ -5606,6 +5902,46 @@ void server_routes::init_routes() {
             return res;
         }
 
+        // d1: optional explicit trunk id + bypass flag for the decision prefix cache.
+        // gated on the default-off flag; when off, the fields stay default (no new behavior).
+        // wrong types or overlong ids are a clean 400 (never silent); ids are only logged
+        // as length + hex digest, never raw.
+        std::string d1_trunk_id;
+        bool d1_bypass = false;
+        int d1_slot = -1;
+        if (params.decision_prefix_cache) {
+            if (body.contains("id_slot")) {
+                if (!body.at("id_slot").is_number_integer()) {
+                    res->error(format_error_response("id_slot must be an integer", ERROR_TYPE_INVALID_REQUEST));
+                    return res;
+                }
+                const int64_t requested_slot = body.at("id_slot").get<int64_t>();
+                if (requested_slot < 0 || requested_slot >= params.n_parallel) {
+                    res->error(format_error_response("id_slot must name an existing slot", ERROR_TYPE_INVALID_REQUEST));
+                    return res;
+                }
+                d1_slot = (int) requested_slot;
+            }
+            if (body.contains("trunk_id")) {
+                if (!body.at("trunk_id").is_string()) {
+                    res->error(format_error_response("trunk_id must be a string", ERROR_TYPE_INVALID_REQUEST));
+                    return res;
+                }
+                d1_trunk_id = body.at("trunk_id").get<std::string>();
+                if (d1_trunk_id.size() > 128) {
+                    res->error(format_error_response("trunk_id must be at most 128 characters", ERROR_TYPE_INVALID_REQUEST));
+                    return res;
+                }
+            }
+            if (body.contains("cache_bypass")) {
+                if (!body.at("cache_bypass").is_boolean()) {
+                    res->error(format_error_response("cache_bypass must be a boolean", ERROR_TYPE_INVALID_REQUEST));
+                    return res;
+                }
+                d1_bypass = body.at("cache_bypass").get<bool>();
+            }
+        }
+
         // one task per variant of each question, or one task for all the questions
         auto & rd = res->rd;
         {
@@ -5614,19 +5950,26 @@ void server_routes::init_routes() {
                 server_task task = server_task(SERVER_TASK_TYPE_DECISION);
                 task.id = rd.get_new_id();
                 decision.fill_task_joint(state, questions, files, ctx_server.mctx, ctx_server.init_opt, task);
+                task.decision.trunk_id     = d1_trunk_id;
+                task.decision.cache_bypass = d1_bypass;
                 tasks.push_back(std::move(task));
             } else {
                 for (const auto & question : questions) {
                     for (size_t variant = 0; variant < decision.n_variants(question); variant++) {
                         server_task task = server_task(SERVER_TASK_TYPE_DECISION);
                         task.id = rd.get_new_id();
-                        decision.fill_task(state, questions, question, variant, files, ctx_server.mctx, ctx_server.init_opt, task);
+                        decision.fill_task(state, questions, question, variant, files, ctx_server.mctx, ctx_server.init_opt, task, params.decision_prefix_cache);
+                        task.decision.trunk_id     = d1_trunk_id;
+                        task.decision.cache_bypass = d1_bypass;
                         tasks.push_back(std::move(task));
                     }
                 }
             }
             if (decision.can_share_prompt()) {
                 tasks = server_decision_group_tasks(std::move(tasks), params.n_parallel);
+            }
+            for (auto & task : tasks) {
+                task.id_slot = d1_slot;
             }
             rd.post_tasks(std::move(tasks));
         }

@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstring>
 #include <regex>
 #include <stdexcept>
 
@@ -657,13 +658,68 @@ void server_decision_context::fill_task(
         const std::vector<raw_buffer> & files,
         mtmd_context * mctx,
         const mtmd_helper_init_opt & init_opt,
-        server_task & task) const {
+        server_task & task,
+        bool cache_prefix) const {
     if (type == COMMON_DECISION_TYPE_LFM2_D1_OMNI) {
         fill_task_d1omni(state, questions, question, variant, files, mctx, init_opt, task);
         return;
     }
 
     const std::string prompt = render(state, questions, question, variant, files.size());
+
+    // Probe the question boundary without changing the real prompt.
+    static const char * d1_sentinel0 = "AQ7D1PREFIXSENTINEL";
+    static const char * d1_sentinel1 = "ZK3D1PREFIXSENTINEL";
+    auto d1_earliest = [&](const std::string & p, const char * s, size_t & count) -> size_t {
+        const size_t first = p.find(s);
+        count = 0;
+        if (first == std::string::npos) {
+            return std::string::npos;
+        }
+        const size_t len = strlen(s);
+        for (size_t pos = first; (pos = p.find(s, pos)) != std::string::npos; pos += len) {
+            count++;
+        }
+        return first;
+    };
+    auto d1_make_sentinel = [&](const char * s) {
+        server_decision_question q;
+        q.id           = s;
+        q.type         = SERVER_DECISION_QUESTION_CHOICE;
+        q.instructions = std::string(s);
+        q.options      = {{std::string(s), json(std::string(s))}};
+        return q;
+    };
+    // string-level boundary; npos on any failure
+    auto d1_string_boundary = [&]() -> size_t {
+        if (!cache_prefix || type != COMMON_DECISION_TYPE_LFM2_D1) {
+            return std::string::npos;
+        }
+        const std::string dump = state.dump();
+        if (dump.find(d1_sentinel0) != std::string::npos || dump.find(d1_sentinel1) != std::string::npos) {
+            return std::string::npos; // printable collision with state
+        }
+        std::string p0, p1;
+        try {
+            p0 = render(state, questions, d1_make_sentinel(d1_sentinel0), 0, files.size());
+            p1 = render(state, questions, d1_make_sentinel(d1_sentinel1), 0, files.size());
+        } catch (...) {
+            return std::string::npos;
+        }
+        size_t c0 = 0, c1 = 0;
+        const size_t a = d1_earliest(p0, d1_sentinel0, c0);
+        const size_t b = d1_earliest(p1, d1_sentinel1, c1);
+        if (a == std::string::npos || a != b || c0 != c1) {
+            return std::string::npos;
+        }
+        if (p0.compare(0, a, p1, 0, a) != 0) {
+            return std::string::npos;
+        }
+        if (a == 0 || a > prompt.size() || prompt.compare(0, a, p0, 0, a) != 0) {
+            return std::string::npos;
+        }
+        return a;
+    };
 
     if (type == COMMON_DECISION_TYPE_OPENJEV || type == COMMON_DECISION_TYPE_LEV || type == COMMON_DECISION_TYPE_NIMBLE || type == COMMON_DECISION_TYPE_PPLX_DECIDER) {
         // lev reads the ratings of a noul question at its first labels, not at the digits
@@ -680,7 +736,32 @@ void server_decision_context::fill_task(
     }
     if (type == COMMON_DECISION_TYPE_OPENJEV || type == COMMON_DECISION_TYPE_LEV || type == COMMON_DECISION_TYPE_NIMBLE || type == COMMON_DECISION_TYPE_PPLX_DECIDER || type == COMMON_DECISION_TYPE_LFM2_D1) {
         if (!files.empty()) {
+            const int64_t media_start = ggml_time_us();
             task.tokens = process_mtmd_prompt(mctx, prompt, files, init_opt);
+            const int64_t media_prepare_us = ggml_time_us() - media_start;
+            if (type == COMMON_DECISION_TYPE_LFM2_D1 && cache_prefix) {
+                // media-aware boundary: re-process both sentinel prompts through
+                // mtmd (same files, same ids) and take the conservative common
+                // prefix; get_common_prefix never cuts inside a chunk.
+                // Extra CPU image decode cost is expected; no GPU encode here.
+                try {
+                    const std::string sp0 = render(state, questions, d1_make_sentinel(d1_sentinel0), 0, files.size());
+                    const std::string sp1 = render(state, questions, d1_make_sentinel(d1_sentinel1), 0, files.size());
+                    server_tokens st0 = process_mtmd_prompt(mctx, sp0, files, init_opt);
+                    server_tokens st1 = process_mtmd_prompt(mctx, sp1, files, init_opt);
+                    size_t n0 = task.tokens.get_common_prefix(st0);
+                    size_t n1 = task.tokens.get_common_prefix(st1);
+                    size_t n01 = st0.get_common_prefix(st1);
+                    size_t n = std::min({n0, n1, n01});
+                    task.decision.prefix_end = n > (size_t) INT32_MAX ? 0 : (int32_t) n;
+                } catch (...) {
+                    task.decision.prefix_end = 0;
+                }
+            }
+            if (cache_prefix) {
+                SRV_INF("decision media preparation: decode = %.3f ms, boundary probes = %.3f ms, prefix = %d\n",
+                        media_prepare_us / 1000.0, (ggml_time_us() - media_start - media_prepare_us) / 1000.0, task.decision.prefix_end);
+            }
             return;
         }
     }
@@ -700,6 +781,25 @@ void server_decision_context::fill_task(
             throw std::runtime_error("unexpected layout of the decision prompt");
         }
         task.decision.pointer = tokens.size() - 1;
+    }
+    if (type == COMMON_DECISION_TYPE_LFM2_D1 && cache_prefix) {
+        // text path: tokenize the verified state-only string prefix, then trim
+        // trailing tokens while BPE merges disagree; shorter is still correct.
+        const size_t n = d1_string_boundary();
+        if (n != std::string::npos) {
+            const llama_tokens tp = common_tokenize(vocab, prompt.substr(0, n), false, true);
+            size_t k = std::min(tp.size(), tokens.size());
+            while (k > 0 && tp[k - 1] != tokens[k - 1]) {
+                k--; // only trims within the verified state string, stays safe
+            }
+            // head-match check: common head of tp/tokens, not just last token
+            size_t head = 0;
+            while (head < k && tp[head] == tokens[head]) {
+                head++;
+            }
+            k = head;
+            task.decision.prefix_end = k > (size_t) INT32_MAX ? 0 : (int32_t) k;
+        }
     }
     task.tokens = server_tokens(tokens, false);
 }
@@ -1146,9 +1246,15 @@ std::vector<server_task> server_decision_group_tasks(std::vector<server_task> &&
 
         // every task must have at least one token of its own to evaluate
         size_t n_shared = parent.tokens.size() - 1;
+        if (parent.decision.prefix_end > 0) {
+            n_shared = std::min(n_shared, (size_t) parent.decision.prefix_end);
+        }
         for (size_t j = i + 1; j < end; j++) {
             n_shared = std::min(n_shared, parent.tokens.get_common_prefix(tasks[j].tokens));
             n_shared = std::min(n_shared, tasks[j].tokens.size() - 1);
+            if (tasks[j].decision.prefix_end > 0) {
+                n_shared = std::min(n_shared, (size_t) tasks[j].decision.prefix_end);
+            }
         }
 
         if (end - i < 2 || n_shared == 0) {
